@@ -25,18 +25,21 @@
 		}
 
 		function getData(e) {
+			console.log('Sending request')
 			$.ajax({
-				url: '/blocks/665975',
+				url: '/blocks/665972',
 				method: 'GET',
 				success: function(data) {
 					console.log(data);
 					var message = '<hr>';
 					message += JSON.stringify(data, null, '    ');
 					document.body.innerHTML += message;
+					console.log('Completed.')
 				},
 
-				error: function(err) {
+				error: function(error) {
 					console.log('Failed');
+					console.log(error)
 				}
 			});
 		}

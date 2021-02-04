@@ -8,22 +8,37 @@ const REDIS_PORT = process.env.REDIS_PORT || 6379;
 const redisClient = redis.createClient(REDIS_PORT);
 const app = express();
 
-async function getBlock(height) {
-	
-	return await redisClient.get(height.toString(), (error, reply) => {
-		if(error) {
-			console.log('Fetching block at height ' + height);
-			return fetch(`https://blockchain.info/block-height/${height}?format=json`, {method:'GET'})
-				.then(res => res.json())
-				.then((json) => {
-					return json;
-				});
-		} else {
-			console.log('Found cached block at height ' + height);
-			return JSON.parse(reply.toString());
+async function fetchFromBlockchain(height) {
+	return await fetch(`https://blockchain.info/block-height/${height}?format=json`, {method:'GET'})
+		.then(res => res.json())
+		.then((json) => {
+			console.log('Returned!')
+			return json;
 		}
+	);
+}
 
+async function getBlock(height) {
+	console.log('LET    US     BEGIN!!!');
+	//return await fetchFromBlockchain(height);
+	block = await new Promise(resolve => {
+		redisClient.get(height.toString(), async function(error, reply) {
+			//console.log(reply)
+			if(error || reply == null) {
+				console.log('!!! Fetching from online, block at height ' + height);
+				//return 100;//await fetchFromBlockchain(height);
+				//return processBlock(height, await fetchFromBlockchain(height));
+				let rawBlock = await fetchFromBlockchain(height);
+				resolve(processBlock(height, rawBlock));
+
+			} else {
+				console.log('!!! Found cached block at height ' + height);
+				resolve(JSON.parse(reply.toString()));
+			}
+
+		});
 	});
+	return block;
 }
 
 // Given a raw block straight from blockchain.com, convert it into one we can use
@@ -67,13 +82,13 @@ function processBlock(height, rawBlock) {
 	transactions = [];
 	// Process each transaction into only the data that is needed
 	if('tx' in _block) {
-		for(let tx in _block['tx']) {
+		for(let tx of _block['tx']) {
 			tx_value_with_fee = 0;
 			tx_value = 0;
 			tx_value_unspent = 0;
 			// Compute the input value (includes fee)
 			if('inputs' in tx) {
-				for(let input in tx['inputs']) {
+				for(let input of tx['inputs']) {
 					if('prev_out' in input) {
 						tx_value_with_fee += input['prev_out']['value'] || 0;
 					}
@@ -81,7 +96,7 @@ function processBlock(height, rawBlock) {
 			}
 			// Compute the output value (excludes fee)
 			if('out' in tx) {
-				for(let output in tx['out']) {
+				for(let output of tx['out']) {
 					tx_value += output['value'] || 0;
 					if('spent' in output && output['spent'] == false) {
 						tx_value_unspent += output['value'] || 0;
@@ -105,19 +120,19 @@ function processBlock(height, rawBlock) {
 		}
 	}
 	// Build the transaction histogram
-	let quantile_0 = transaction_quantile(transactions, 25);
+	let quantile_0 = transaction_quantile(transactions, 0);
 	let quantile_25 = transaction_quantile(transactions, 25);
-	let quantile_33 = transaction_quantile(transactions, 25);
-	let quantile_50 = transaction_quantile(transactions, 25);
-	let quantile_66 = transaction_quantile(transactions, 25);
-	let quantile_75 = transaction_quantile(transactions, 25);
-	let quantile_100 = transaction_quantile(transactions, 25);
+	let quantile_33 = transaction_quantile(transactions, 33);
+	let quantile_50 = transaction_quantile(transactions, 50);
+	let quantile_66 = transaction_quantile(transactions, 66);
+	let quantile_75 = transaction_quantile(transactions, 75);
+	let quantile_100 = transaction_quantile(transactions, 100);
 
 	// Only keep quartile 3 and greater
 	tx_histogram = new Array(100).fill([]);
-	for(let tx in transactions) {
+	for(let tx of transactions) {
 		if(tx.value < quantile_75) continue;
-		let index = Math.floor(((tx.value - quantile_75) / (max_tx_value - quantile_75)) * 100);
+		let index = Math.floor(((tx.value - quantile_75) / (max_tx_value - quantile_75)) * 99);
 		tx_histogram[index].push(tx);
 	}
 
@@ -131,9 +146,8 @@ function processBlock(height, rawBlock) {
 	block['histogram'] = tx_histogram;
 
 	// TODO: Add a way to override caching, if a block is outdated or something
-	if(shouldCache) {
-		redisClient.set(height.toString(), JSON.stringify(block));
-	}
+	console.log('IT HAS BEEN CACHED')
+	redisClient.set(height.toString(), JSON.stringify(block));
 
 	return block;
 }
@@ -145,11 +159,11 @@ function transaction_quantile(transactions, percentile) {
     });
     let index = percentile / 100 * (transactions.length - 1);
     if(Math.floor(index) == index) {
-    	quantile = transactions[index];
+    	quantile = transactions[index].value;
     } else {
         i = Math.floor(index);
         fraction = index - i;
-        quantile = transactions[i] + (transactions[i + 1] - transactions[i]) * fraction;
+        quantile = transactions[i].value + (transactions[i + 1].value - transactions[i].value) * fraction;
     }
     return quantile;
 }
@@ -172,8 +186,12 @@ app.get('/blocks/:height',(request, response) => {
 		response.json(null);
 		return;
 	}
-	getBlock(height).then((rawBlock) => {
-		let block = processBlock(height, rawBlock);
+	getBlock(height).then((block) => {
+		if(typeof block != 'object') {
+			response.json({'Error?': 'unfortunately'});
+			return;
+		}
+		
     	response.json(block);
 	});
 });
