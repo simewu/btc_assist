@@ -9,11 +9,12 @@ const PORT = process.env.PORT || 3000;
 let redisClient
 if(process.env.REDISCLOUD_URL){
 	let redisURL = url.parse(process.env.REDISCLOUD_URL);
+	console.log(redisURL);
 	redisClient = redis.createClient(redisURL)
+	redisClient.auth('Grn9tWQrSkftZpbwksWZjN9i26JnKb7b');
 } else {
 	const redisPort = process.env.redisPort || 6379;
 	redisClient = redis.createClient(redisPort);
-	redisClient.auth('Grn9tWQrSkftZpbwksWZjN9i26JnKb7b');
 }
 
 // Mainenance
