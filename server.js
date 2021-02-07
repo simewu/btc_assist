@@ -1,12 +1,17 @@
 const fetch = require('node-fetch');
 const express = require('express');
 const redis = require('redis');
+const app = express();
 
 const PORT = process.env.PORT || 3000;
 const REDIS_PORT = process.env.REDIS_PORT || 6379;
-
-const redisClient = redis.createClient(REDIS_PORT);
-const app = express();
+let redisClient
+if(process.env.REDISCLOUD_URL){
+	let redisURL = url.parse(process.env.REDISCLOUD_URL);
+	redisClient = redis.createClient(redisURL)
+} else {
+	redisClient = redis.createClient(REDIS_PORT);
+}
 
 // Mainenance
 var queue = [], queueInterval = null, knownBlocks = [], maxKnownBlock = null, latestHeight = null;
