@@ -1,6 +1,7 @@
 const fetch = require('node-fetch');
 const express = require('express');
 const redis = require('redis');
+const url = require('url');
 const app = express();
 
 const PORT = process.env.PORT || 3000;
