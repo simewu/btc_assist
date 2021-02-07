@@ -5,13 +5,15 @@ const url = require('url');
 const app = express();
 
 const PORT = process.env.PORT || 3000;
-const REDIS_PORT = process.env.REDIS_PORT || 6379;
+
 let redisClient
 if(process.env.REDISCLOUD_URL){
 	let redisURL = url.parse(process.env.REDISCLOUD_URL);
 	redisClient = redis.createClient(redisURL)
 } else {
-	redisClient = redis.createClient(REDIS_PORT);
+	const redisPort = process.env.redisPort || 6379;
+	redisClient = redis.createClient(redisPort);
+	redisClient.auth('Grn9tWQrSkftZpbwksWZjN9i26JnKb7b');
 }
 
 // Mainenance
