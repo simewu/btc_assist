@@ -1,31 +1,26 @@
 {
-  "name": "btc_assistant",
+  "name": "btc_assist",
   "version": "1.0.0",
-  "description": "A Bitcoin Assistant",
+  "description": "This application is currently under development.  This is a node.js server that will host an application that maintains the Bitcoin blockchain, and enables real-time tracking of various critical parameters.",
   "main": "server.js",
-  "directories": {
-    "lib": "lib"
-  },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "nodemon server.js"
+    "start": "node server.js"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/simewu/btc_assistant.git"
+    "url": "git+https://github.com/simewu/btc_assist.git"
   },
   "author": "Simeon Wuthier",
   "license": "ISC",
   "bugs": {
-    "url": "https://github.com/simewu/btc_assistant/issues"
+    "url": "https://github.com/simewu/btc_assist/issues"
   },
-  "homepage": "https://github.com/simewu/btc_assistant#readme",
+  "homepage": "https://github.com/simewu/btc_assist#readme",
   "dependencies": {
     "express": "^4.17.1",
     "node-fetch": "^2.6.1",
     "redis": "^3.0.2"
   },
-  "devDependencies": {
-    "nodemon": "^2.0.7"
-  }
+  "devDependencies": {}
 }
