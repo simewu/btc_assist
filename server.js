@@ -8,7 +8,82 @@ const REDIS_PORT = process.env.REDIS_PORT || 6379;
 const redisClient = redis.createClient(REDIS_PORT);
 const app = express();
 
-async function fetchFromBlockchain(height) {
+// Mainenance
+var queue = [], queueInterval = null, knownBlocks = [], maxKnownBlock = null, latestHeight = null;
+
+Array.prototype.remove = function(value) {
+	for (var i = this.length; i--; ) {
+		if (this[i] === value) {
+			this.splice(i, 1);
+		}
+	}
+}
+
+// Fetch any key from Redis, results the corresponding value, or null
+function redisGet(key) {
+	return new Promise(resolve => {
+		redisClient.get(key.toString(), async function(error, reply) {
+			if(error || reply == null) {
+				resolve(null);
+			} else {
+				resolve(reply.toString());
+			}
+		});
+	});
+}
+
+// Set a key, value within the Redis database
+function redisSet(key, value) {
+	key = key.toString();
+	value = value.toString();
+	redisClient.set(key, value);
+	return value;
+}
+
+// Request a block
+async function getBlock(height) {
+	height = parseInt(height);
+	if(isNaN(height)) return null;
+
+	block = await new Promise(resolve => {
+		redisClient.get(height.toString(), async function(error, reply) {
+			if(error || reply == null) {
+				let rawBlock = await fetchBlockFromBlockchain(height);
+				if(rawBlock === null) {
+					resolve(null);
+				} else {
+					resolve(processBlock(height, rawBlock));
+				}
+			} else {
+				try {
+					resolve(JSON.parse(reply.toString()));
+				} catch(e) {
+					console.log('Failed to convert block ' + height + ' to JSON.');
+					resolve(null);
+				}
+			}
+
+		});
+	});
+	return block;
+}
+
+async function fetchLatestHeightFromBlockchain() {
+	return await fetch('https://blockchain.info/latestblock', {method:'GET'})
+		.then(res => res.json())
+		.then((json) => {
+			if('height' in json) {
+				return json['height'];
+			}
+			return null;
+		})
+		.catch(error => {
+			console.log('Error fetching latest block height');
+			return null;
+		});
+}
+
+async function fetchBlockFromBlockchain(height) {
 	return await fetch(`https://blockchain.info/block-height/${height}?format=json`, {method:'GET'})
 		.then(res => res.json())
 		.then((json) => {
@@ -20,29 +95,10 @@ async function fetchFromBlockchain(height) {
 		});
 }
 
-async function getBlock(height) {
-	block = await new Promise(resolve => {
-		redisClient.get(height.toString(), async function(error, reply) {
-			if(error || reply == null) {
-				console.log('Fetching from online, block at height ' + height);
-				let rawBlock = await fetchFromBlockchain(height);
-				if(rawBlock === null) {
-					resolve();
-				} else {
-					resolve(processBlock(height, rawBlock));
-				}
-			} else {
-				console.log('Found cached block at height ' + height);
-				resolve(JSON.parse(reply.toString()));
-			}
-
-		});
-	});
-	return block;
-}
-
 // Given a raw block straight from blockchain.com, convert it into one we can use
 function processBlock(height, rawBlock) {
+	let epoch = Math.round(Date.now() / 1000);
+	let _block = null
 	if('blocks' in rawBlock) {
 		switch(rawBlock['blocks'].length) {
 			case 0:
@@ -51,150 +107,353 @@ function processBlock(height, rawBlock) {
 				break;
 			case 1:
 				_block = rawBlock['blocks'][0];
+				break;
 			default:
-				console.log(`Fork detected on height ${height}`)
-				_block = rawBlock['blocks'][0];
+				console.log(`Fork detected on height ${height}`);
+				for(b of rawBlock['blocks']) {
+					if(('main_chain' in b) && b['main_chain'] == true) {
+						_block = rawBlock['blocks'][0];
+						break
+					}
+				}
 		}
 	} else {
 		console.log(`Block not in "blocks" object: ${rawBlock}`);
 		_block = rawBlock;
 	}
+	if(_block === null || !('main_chain' in _block) || _block['main_chain'] != true) return null
 
-	let block = {};
-	block['height'] = _block['height'] || height;
-	block['size'] = _block['size'] || 0;
-	block['num_tx'] = _block['n_tx'] || 0;
-	block['timestamp'] = _block['timestamp'] || height;
-	block['fee'] = _block['fee'] || 0;
-	block['hash'] = _block['hash'] || 0;
-	block['prev_hash'] = _block['prev_hash'] || 0;
-	block['main_chain'] = _block['main_chain'] || true;
-	block['block_index'] = _block['block_index'] || 0;
-	block['merkle_root'] = _block['mrkl_root'] || '';
-	block['nonce'] = _block['nonce'] || '';
-	block['bits'] = _block['bits'] || 0;
 
-	transactions = [];
+
+	let _transactions = [];
+	let transactions = [];
 	// Process each transaction into only the data that is needed
+	let coinbase_value = 0;
+	let totalTxValue = 0;
+	let totalTxValueUnspent = 0;
+	let totalTxFee = 0;
 	if('tx' in _block) {
 		for(let tx of _block['tx']) {
-			tx_value_with_fee = 0;
-			tx_value = 0;
-			tx_value_unspent = 0;
+			let isCoinbase = false;
+			txValueWithFee = 0;
+			txValue = 0;
+			txValueUnspent = 0;
 			// Compute the input value (includes fee)
 			if('inputs' in tx) {
 				for(let input of tx['inputs']) {
 					if('prev_out' in input) {
-						tx_value_with_fee += input['prev_out']['value'] || 0;
+						txValueWithFee += input['prev_out']['value'] || 0;
+					} else {
+						isCoinbase = true;
 					}
 				}
 			}
 			// Compute the output value (excludes fee)
 			if('out' in tx) {
 				for(let output of tx['out']) {
-					tx_value += output['value'] || 0;
-					if('spent' in output && output['spent'] == false) {
-						tx_value_unspent += output['value'] || 0;
+					if(isCoinbase) {
+						coinbase_value += output['value'] || 0;
+					} else {
+						txValue += output['value'] || 0;
+						if('spent' in output && output['spent'] == false) {
+							txValueUnspent += output['value'] || 0;
+						}
 					}
 				}
 			}
 			// Satoshi to BTC
-			fee = (tx_value_with_fee - tx_value) / 100000000;
-			tx_value /= 100000000;
-			tx_value_unspent /= 100000000;
-			hash = tx['hash'] || '';
+			tx_fee = (txValueWithFee - txValue) / 100000000;
+			txValue /= 100000000;
+			txValueUnspent /= 100000000;
 
-			transactions.push({
-				value: tx_value,
-				value_unspent: tx_value_unspent,
-				fee: fee,
-				hash: hash
+			totalTxValue += txValue;
+			totalTxValueUnspent += txValueUnspent;
+			totalTxFee += tx_fee;
+
+			_transactions.push({
+				value: txValue,
+				valueUnspent: txValueUnspent,
+				fee: tx_fee
 			})
 		}
 	}
-	// Build the transaction histogram
-	let quantile_0 = transaction_quantile(false, transactions, 0); // Min value
-	let quantile_25 = transaction_quantile(false, transactions, 25);
-	let quantile_33 = transaction_quantile(false, transactions, 33);
-	let quantile_50 = transaction_quantile(false, transactions, 50);
-	let quantile_66 = transaction_quantile(false, transactions, 66);
-	let quantile_75 = transaction_quantile(false, transactions, 75);
-	let quantile_100 = transaction_quantile(false, transactions, 100); // Max value
-
-	let quantile_0_unspent = transaction_quantile(true, transactions, 0); // Min value
-	let quantile_25_unspent = transaction_quantile(true, transactions, 25);
-	let quantile_33_unspent = transaction_quantile(true, transactions, 33);
-	let quantile_50_unspent = transaction_quantile(true, transactions, 50);
-	let quantile_66_unspent = transaction_quantile(true, transactions, 66);
-	let quantile_75_unspent = transaction_quantile(true, transactions, 75);
-	let quantile_100_unspent = transaction_quantile(true, transactions, 100); // Max value
-
-	// Only keep quartile 3 and greater
-	tx_histogram = new Array(100).fill([]);
-	for(let tx of transactions) {
-		if(tx.value < quantile_75) continue;
-		if(quantile_100 - quantile_75 == 0) continue;
-		let index = Math.floor(((tx.value - quantile_75) / (quantile_100 - quantile_75)) * 99);
-		tx_histogram[index].push(tx);
+	coinbase_value /= 100000000;
+	numTxValuesAt = {
+		'0.125': 0,
+		'0.25': 0,
+		'0.5': 0,
+		'1': 0,
+		'2': 0,
+		'4': 0,
+		'8': 0,
+		'16': 0,
+		'32': 0,
+		'64': 0,
+		'128': 0,
+		'256': 0,
+		'512': 0,
+		'1024': 0,
+		'2048': 0,
+		'4096': 0,
+	}
+	numTxValuesUnspentAt = {
+		'0.125': 0,
+		'0.25': 0,
+		'0.5': 0,
+		'1': 0,
+		'2': 0,
+		'4': 0,
+		'8': 0,
+		'16': 0,
+		'32': 0,
+		'64': 0,
+		'128': 0,
+		'256': 0,
+		'512': 0,
+		'1024': 0,
+		'2048': 0,
+		'4096': 0,
 	}
 
-	block['tx_quantile_0'] = quantile_0; // Min value
-	block['tx_quantile_25'] = quantile_25;
-	block['tx_quantile_33'] = quantile_33;
-	block['tx_quantile_50'] = quantile_50;
-	block['tx_quantile_66'] = quantile_66;
-	block['tx_quantile_75'] = quantile_75;
-	block['tx_quantile_100'] = quantile_100; // Max value
+	for(let tx of _transactions) {
+		if(tx.value >= 0.125) numTxValuesAt['0.125']++;
+		if(tx.value >= 0.25) numTxValuesAt['0.25']++;
+		if(tx.value >= 0.5) numTxValuesAt['0.5']++;
+		if(tx.value >= 1) numTxValuesAt['1']++;
+		if(tx.value >= 2) numTxValuesAt['2']++;
+		if(tx.value >= 4) numTxValuesAt['4']++;
+		if(tx.value >= 8) numTxValuesAt['8']++;
+		if(tx.value >= 16) numTxValuesAt['16']++;
+		if(tx.value >= 32) numTxValuesAt['32']++;
+		if(tx.value >= 64) numTxValuesAt['64']++;
+		if(tx.value >= 128) numTxValuesAt['128']++;
+		if(tx.value >= 256) numTxValuesAt['256']++;
+		if(tx.value >= 512) numTxValuesAt['512']++;
+		if(tx.value >= 1024) numTxValuesAt['1024']++;
+		if(tx.value >= 2048) numTxValuesAt['2048']++;
+		if(tx.value >= 4096) numTxValuesAt['4096']++;
 
-	block['tx_quantile_0_unspent'] = quantile_0_unspent; // Min value
-	block['tx_quantile_25_unspent'] = quantile_25_unspent;
-	block['tx_quantile_33_unspent'] = quantile_33_unspent;
-	block['tx_quantile_50_unspent'] = quantile_50_unspent;
-	block['tx_quantile_66_unspent'] = quantile_66_unspent;
-	block['tx_quantile_75_unspent'] = quantile_75_unspent;
-	block['tx_quantile_100_unspent'] = quantile_100_unspent; // Max value
+		if(tx.valueUnspent >= 0.125) numTxValuesUnspentAt['0.125']++;
+		if(tx.valueUnspent >= 0.25) numTxValuesUnspentAt['0.25']++;
+		if(tx.valueUnspent >= 0.5) numTxValuesUnspentAt['0.5']++;
+		if(tx.valueUnspent >= 1) numTxValuesUnspentAt['1']++;
+		if(tx.valueUnspent >= 2) numTxValuesUnspentAt['2']++;
+		if(tx.valueUnspent >= 4) numTxValuesUnspentAt['4']++;
+		if(tx.valueUnspent >= 8) numTxValuesUnspentAt['8']++;
+		if(tx.valueUnspent >= 16) numTxValuesUnspentAt['16']++;
+		if(tx.valueUnspent >= 32) numTxValuesUnspentAt['32']++;
+		if(tx.valueUnspent >= 64) numTxValuesUnspentAt['64']++;
+		if(tx.valueUnspent >= 128) numTxValuesUnspentAt['128']++;
+		if(tx.valueUnspent >= 256) numTxValuesUnspentAt['256']++;
+		if(tx.valueUnspent >= 512) numTxValuesUnspentAt['512']++;
+		if(tx.valueUnspent >= 1024) numTxValuesUnspentAt['1024']++;
+		if(tx.valueUnspent >= 2048) numTxValuesUnspentAt['2048']++;
+		if(tx.valueUnspent >= 4096) numTxValuesUnspentAt['4096']++;
 
-	block['histogram'] = tx_histogram;
+		transactions.push(tx.value);
+	}
+
+	let block = {};
+	block['height'] = _block['height'] || height;
+	block['size'] = _block['size'] || 0;
+	block['num_tx'] = _block['n_tx'] || 0;
+	block['timestamp'] = _block['time'] || height;
+	block['timestamp_fetched'] = epoch;
+	block['coinbase_value'] = coinbase_value;
+	block['total_tx_value'] = totalTxValue;
+	block['total_tx_value_unspent'] = totalTxValueUnspent;
+	block['total_tx_fee'] = totalTxFee;
+	block['hash'] = _block['hash'] || 0;
+	block['prev_hash'] = _block['prev_block'] || '';
+	block['nonce'] = _block['nonce'] || '';
+	block['bits'] = _block['bits'] || 0;
+
+	block['num_tx_values_at'] = numTxValuesAt;
+	block['num_tx_values_unspent_at'] = numTxValuesUnspentAt;
+	block['transactions'] = transactions;
+
+	/*// Build the transaction histogram
+	let quantile_values = {
+		'0': transaction_quantile('value', transactions, 0), // Max value
+		'25': transaction_quantile('value', transactions, 25),
+		'50': transaction_quantile('value', transactions, 50),
+		'75': transaction_quantile('value', transactions, 75),
+		'99': transaction_quantile('value', transactions, 99),
+		'100': transaction_quantile('value', transactions, 100) // Min value
+	};
+	let quantile_values_unspent = {
+		'0': transaction_quantile('valueUnspent', transactions, 0), // Max value
+		'25': transaction_quantile('valueUnspent', transactions, 25),
+		'50': transaction_quantile('valueUnspent', transactions, 50),
+		'75': transaction_quantile('valueUnspent', transactions, 75),
+		'99': transaction_quantile('valueUnspent', transactions, 99),
+		'100': transaction_quantile('valueUnspent', transactions, 100) // Min value
+	};
+	let quantile_fees = {
+		'0': transaction_quantile('fee', transactions, 0), // Max value
+		'25': transaction_quantile('fee', transactions, 25),
+		'50': transaction_quantile('fee', transactions, 50),
+		'75': transaction_quantile('fee', transactions, 75),
+		'99': transaction_quantile('fee', transactions, 99),
+		'100': transaction_quantile('fee', transactions, 100) // Min value
+	};
+
+	tx_histogram_values = new Array(10).fill(0);
+	tx_histogram_values_unspent = new Array(10).fill(0);
+	tx_histogram_fees = new Array(10).fill(0);
+
+	top_99_percentile_tx_values = [];
+	top_99_percentile_tx_values_unspent = [];
+	top_99_percentile_tx_fees = [];
+
+	let index, index_unspent, index_fees;
+	for(let tx of transactions) {
+		if(quantile_values['100'] == 0) index = 0
+		else index = Math.floor((tx.value / quantile_values['100']) * 9);
+		tx_histogram_values[index]++;
+
+		if(quantile_values_unspent['100'] == 0) index_unspent = 0
+		else index_unspent = Math.floor((tx.valueUnspent / quantile_values_unspent['100']) * 9);
+		tx_histogram_values_unspent[index_unspent]++;
+
+		if(quantile_fees['100'] == 0) index_fees = 0
+		else index_fees = Math.floor((tx.fee / quantile_fees['100']) * 9);
+		tx_histogram_fees[index_fees]++;
+
+		if(tx.value >= quantile_values['99']) top_99_percentile_tx_values.push(tx);
+		if(tx.valueUnspent >= quantile_values_unspent['99']) top_99_percentile_tx_values_unspent.push(tx);
+		if(tx.fee >= quantile_fees['99']) top_99_percentile_tx_fees.push(tx);
+	}
+
+	block['quantile_values'] = quantile_values;
+	block['quantile_values_unspent'] = quantile_values_unspent;
+	block['quantile_fees'] = quantile_fees;
+
+	block['histogram_values'] = tx_histogram_values;
+	block['histogram_values_unspent'] = tx_histogram_values_unspent;
+	block['histogram_fees'] = tx_histogram_fees;
+
+	block['top_99_percentile_tx_values'] = top_99_percentile_tx_values;
+	block['top_99_percentile_tx_values_unspent'] = top_99_percentile_tx_values_unspent;
+	block['top_99_percentile_tx_fees'] = top_99_percentile_tx_fees;*/
 
 	// TODO: Add a way to override caching, if a block is outdated or something
-	console.log(`Height ${height} has been cached.`)
-	redisClient.set(height.toString(), JSON.stringify(block));
+	
+	redisSet(height.toString(), JSON.stringify(block));
+	queue.remove(height);
+	knownBlocks.push(height);
+	console.log(`Block height ${height} has been cached.`)
 
 	return block;
 }
 
 // Compute the quantile, which is the percentage of a threshold
-function transaction_quantile(unspent, transactions, percentile) {
-    if(unspent) {
-    	transactions.sort((a, b) => {
-	    	return a.value_unspent - b.value_unspent;
-	    });
-    } else {
-	    transactions.sort((a, b) => {
-	    	return a.value - b.value;
-	    });
-    }
-    let index = percentile / 100 * (transactions.length - 1);
-    if(Math.floor(index) == index) {
-    	quantile = unspent? transactions[index].value_unspent : transactions[index].value;
-    } else {
-        i = Math.floor(index);
-        fraction = index - i;
-        if(unspent) {
-        	quantile = transactions[i].value_unspent + (transactions[i + 1].value_unspent - transactions[i].value_unspent) * fraction;
-        } else {
-        	quantile = transactions[i].value + (transactions[i + 1].value - transactions[i].value) * fraction;
-   		}
-    }
-    return quantile;
+/*function transaction_quantile(key, transactions, percentile) {
+	transactions.sort((a, b) => {
+		return a[key] - b[key];
+	});
+	let index = percentile / 100 * (transactions.length - 1);
+	if(Math.floor(index) == index) {
+		quantile = transactions[index][key];
+	} else {
+		i = Math.floor(index);
+		fraction = index - i;
+		quantile = transactions[i][key] + (transactions[i + 1][key] - transactions[i][key]) * fraction;
+	}
+	return quantile;
+}*/
+
+/*
+ * Maintenance functions
+ */
+
+// Keep a list of known blocks in memory
+redisClient.keys('*', (err, keys) => {
+	if(err) throw err;
+	for(key of keys) {
+		var height = parseInt(key);
+		if(!isNaN(height)) {
+			knownBlocks.push(height);
+		}
+	}
+	knownBlocks.sort();
+	console.log('Loaded in known blocks.');
+});
+
+// Fetch the maxKnownBlock variable from the database
+redisGet('maxKnownBlock').then(result => {
+	maxKnownBlock = parseInt(result) || 0;
+	if(maxKnownBlock == null) {
+		redisSet('maxKnownBlock', 0);
+		maxKnownBlock = 0;
+	}
+	console.log(`Loaded in max known height: ${maxKnownBlock}.`);
+
+	setTimeout(updateBlockchain, 10 * 1000); // Wait 10 seconds before looking to the blockchain data
+});
+
+// Ran every 3 minutes
+async function regularBlockFetcher() {
+	if(queue.length == 0) { // Stop checking if the queue is empty
+		clearInverval(queueInterval);
+		queueInterval = null;
+		return;
+	}
+	var block = queue[0];
+	// Remove already known entries
+	while(knownBlocks.includes(block)) {
+		if(queue.length == 0) { // If nothing is left in the queue, stop looking
+			clearInverval(queueInterval);
+			queueInterval = null;
+			return;
+		}
+		queue.shift();
+		block = queue[0];
+	}
+	console.log(`Regular mainenance: Fetched block ${block} from online.`);
+	await getBlock(block);
+	if(block > maxKnownBlock) {
+		redisSet('maxKnownBlock', block);
+		maxKnownBlock = block;
+	}
 }
+
+// Gets the latest block height, then verifies that the queue is being handled
+async function updateBlockchain() {
+	let epoch = Math.round(Date.now() / 1000);
+	latestHeight = await fetchLatestHeightFromBlockchain();
+	if(maxKnownBlock ===  null || latestHeight === null) return;
+
+	var numBlocksAddedToQueue = 0;
+	for(let i = maxKnownBlock + 1; i < latestHeight; i++) {
+		if(!knownBlocks.includes(i)) {
+			queue.push(i);
+			numBlocksAddedToQueue++;
+		}
+	}
+	console.log(`Regular mainenance: Added ${numBlocksAddedToQueue} blocks to the queue.`);
+
+	if(maxKnownBlock != latestHeight) {
+		if(queueInterval === null) {
+			queueInterval = setInterval(regularBlockFetcher, 3 * 60 * 1000);
+		}
+	}
+}
+
+var latestBlockFetcher = setInterval(updateBlockchain, 60 * 60 * 1000); // Every hour
+
+
+/*
+ * App functions
+ */
+
 
 app.set('port', PORT);
 
 /* Routes */
 
 app.get('/',(request, response) => {
-    response.sendFile(`${__dirname}/index.html`);
+	response.sendFile(`${__dirname}/index.html`);
 });
 
 app.get('/lib/:file', (request, response) => {
@@ -213,15 +472,15 @@ app.get('/blocks/:height',(request, response) => {
 			return;
 		}
 		
-    	response.json(block);
+		response.json(block);
 	});
 });
 
 /* Begin listening */
 
-var server = app.listen(PORT, () => {
-	var host = server.address().address;
-	var port = server.address().port;
-	console.log('Listening at localhost port ' + port);
+let server = app.listen(PORT, () => {
+	let host = server.address().address;
+	let port = server.address().port;
+	console.log(`Listening at localhost port ${port}`);
 	console.log();
 });
